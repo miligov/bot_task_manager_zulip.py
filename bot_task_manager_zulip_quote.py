@@ -41,6 +41,15 @@ REDMINE_URL = "http://fmredmine.krista.ru"
 REDMINE_USERNAME = "fm-assembly"
 REDMINE_PASSWORD = "2BhBWwexCmvEC"
 
+# Идентификаторы объектов Redmine, используемые при создании задачи.
+# Они вынесены в константы, чтобы их можно было сохранить в описании
+# и не потерять при разборе исходного сообщения.
+REDMINE_PROJECT_ID = 167
+REDMINE_TRACKER_ID = 3
+REDMINE_STATUS_ID = 7
+REDMINE_PRIORITY_ID = 6
+DEFAULT_ASSIGNEE_ID = 408
+
 redmine = Redmine(
     REDMINE_URL,
     username=REDMINE_USERNAME,
@@ -109,6 +118,95 @@ def zulip_reply(msg, text: str) -> None:
 def strip_emoji(text: str) -> str:
     """Убираем emoji и другие 4-байтные символы, чтобы MySQL не падал."""
     return re.sub(r'[\U00010000-\U0010FFFF]', '', text)
+
+
+def format_message_identifiers(msg: dict) -> str:
+    """
+    Возвращает идентификаторы исходного сообщения в явном виде.
+
+    В разных версиях Zulip API набор полей сообщения немного отличается,
+    поэтому не полагаемся только на ``id`` и ``sender_id``: сохраняем все
+    присутствующие поля, имя которых оканчивается на ``_id``. Это позволяет
+    не потерять, например, ``stream_id`` или ``recipient_id``.
+    """
+    identifiers = []
+    seen = set()
+
+    for key, value in msg.items():
+        if (key == "id" or key.endswith("_id")) and value is not None:
+            identifiers.append(f"{key}: {value}")
+            seen.add(key)
+
+    # Эти поля не являются числовыми ID, но однозначно идентифицируют
+    # отправителя и место сообщения и помогают найти его в Zulip.
+    for key in ("sender_email", "display_recipient", "subject", "topic"):
+        value = msg.get(key)
+        if value is not None and key not in seen:
+            identifiers.append(f"{key}: {value}")
+
+    return "\n".join(identifiers) or "не переданы Zulip API"
+
+
+def build_redmine_description(
+    msg: dict,
+    original_content: str,
+    referenced_issue_id: Optional[int] = None,
+    assigned_to_id: Optional[int] = None,
+    include_create_identifiers: bool = False,
+) -> str:
+    """
+    Формирует описание/комментарий Redmine.
+
+    В Redmine должен попадать именно исходный ``content`` события Zulip.
+    Раньше сообщение разбиралось на ``body`` и ``quoted`` и цитата
+    переносилась в отдельный блок. Это меняло вид сообщения и теряло
+    контекст. Разбор цитаты по-прежнему нужен
+    для определения режима работы бота, но при сохранении используется весь
+    исходный текст одним блоком.
+    """
+    initiator_name = msg.get("sender_full_name", "")
+    initiator_email = msg.get("sender_email", "")
+    parts = [
+        f"Инициатор: {initiator_name} ({initiator_email})",
+        "Идентификаторы Zulip:\n" + format_message_identifiers(msg),
+    ]
+
+    redmine_issue_ids = []
+
+    def add_issue_id(issue_id):
+        if issue_id is not None and issue_id not in redmine_issue_ids:
+            redmine_issue_ids.append(issue_id)
+
+    add_issue_id(referenced_issue_id)
+    for issue_id in find_issue_ids(original_content):
+        add_issue_id(int(issue_id))
+    add_issue_id(get_issue_id_from_plus(original_content))
+
+    redmine_identifiers = [
+        f"issue_id: {issue_id}"
+        for issue_id in redmine_issue_ids
+    ]
+    if assigned_to_id is not None:
+        redmine_identifiers.append(f"assigned_to_id: {assigned_to_id}")
+    if include_create_identifiers:
+        redmine_identifiers.extend(
+            [
+                f"project_id: {REDMINE_PROJECT_ID}",
+                f"tracker_id: {REDMINE_TRACKER_ID}",
+                f"status_id: {REDMINE_STATUS_ID}",
+                f"priority_id: {REDMINE_PRIORITY_ID}",
+            ]
+        )
+    if redmine_identifiers:
+        parts.append("Идентификаторы Redmine:\n" + "\n".join(redmine_identifiers))
+
+    # Не вызываем здесь strip_emoji()/detect_cp1251(): это исходный текст,
+    # который пользователь передал боту, и он должен сохраниться без
+    # удаления символов, вырезания команд или отделения цитаты.
+    parts.append("Исходный текст сообщения:\n<pre>\n" + original_content + "\n</pre>")
+    return "\n\n".join(parts)
+
+
 def remove_code_blocks(text: str) -> str:
     """
     Удаляем fenced code blocks ``` ... ```
@@ -512,36 +610,28 @@ def create_or_update_issue_from_message(msg, content: str) -> None:
     subject = detect_cp1251(subject_raw)[:255]
 
     # ===== Формируем описание =====
-    description_parts = []
+    # Исполнитель определяется до формирования описания, чтобы его Redmine
+    # ID также был сохранен вместе с исходным сообщением.
+    assigned_to_id = None
+    found_assignee = None
+    if append_issue_id is None:
+        assigned_to_id = choose_assignee_from_body(
+            body,
+            default_id=DEFAULT_ASSIGNEE_ID,
+        )
+        found_assignee = find_assignee_mention(body)
 
-    initiator_line = f"Инициатор: {msg['sender_full_name']} ({msg['sender_email']})"
-    description_parts.append(initiator_line)
-
-    # комментарий пользователя (body)
-    user_comment_text = None
-    if body:
-        if append_issue_id is None:
-            user_comment_text = body.strip()
-        else:
-            cmd_pattern = r'^\s*\+\s*(?:#\d+|https?://[^\s]*/issues/\d+)\s*$'
-            blines = body.splitlines()
-            cleaned_lines = [line for line in blines if not re.search(cmd_pattern, line)]
-            user_comment_text = "\n".join(cleaned_lines).strip()
-
-    if user_comment_text:
-        user_comment_text = strip_emoji(user_comment_text)
-        user_comment_text = detect_cp1251(user_comment_text)
-        description_parts.append(f"<pre>\n{user_comment_text}\n</pre>")
-
-    # цитата как дополнительная информация
-    if quoted:
-        quoted_clean = strip_emoji(quoted)
-        quoted_clean = detect_cp1251(quoted)
-        description_parts.append("Дополнительная информация:\n<pre>\n" + quoted_clean + "\n</pre>")
-
-    description = "\n\n".join(description_parts)
-    description = strip_emoji(description)
-    description = detect_cp1251(description)
+    description = build_redmine_description(
+        msg,
+        content,
+        referenced_issue_id=(
+            append_issue_id
+            if append_issue_id is not None
+            else quoted_issue_id
+        ),
+        assigned_to_id=assigned_to_id,
+        include_create_identifiers=append_issue_id is None,
+    )
 
     # ===== Режим "+ задача": добавить комментарий =====
     if append_issue_id is not None:
@@ -587,9 +677,6 @@ def create_or_update_issue_from_message(msg, content: str) -> None:
         return
 
     # ===== НОВАЯ ЗАДАЧА =====
-    assigned_to_id = choose_assignee_from_body(body, default_id=408)
-    found_assignee = find_assignee_mention(body)
-
     if found_assignee:
         logging.info(
             "Создание задачи. Назначаю на %s (id=%s)",
@@ -603,12 +690,12 @@ def create_or_update_issue_from_message(msg, content: str) -> None:
 
     try:
         create_kwargs = {
-            "project_id": 167,
+            "project_id": REDMINE_PROJECT_ID,
             "subject": subject,
-            "tracker_id": 3,
+            "tracker_id": REDMINE_TRACKER_ID,
             "description": description,
-            "status_id": 7,
-            "priority_id": 6,
+            "status_id": REDMINE_STATUS_ID,
+            "priority_id": REDMINE_PRIORITY_ID,
             "assigned_to_id": assigned_to_id,
             "due_date": date_main,
         }
@@ -652,8 +739,10 @@ def handle_event(event):
     if ZULIP_BOT_TOPIC and get_message_topic(msg) != ZULIP_BOT_TOPIC:
         return
 
-    content = (msg.get("content") or "").strip()
-    if not content:
+    # Проверяем пустоту отдельно, но передаем дальше исходную строку без
+    # strip(): пробелы и переносы строк тоже являются частью исходного текста.
+    content = msg.get("content") or ""
+    if not content.strip():
         return
 
     create_or_update_issue_from_message(msg, content)
