@@ -8,6 +8,7 @@ import json
 import datetime
 import logging
 from typing import List, Optional, Tuple
+from urllib.parse import unquote
 import os
 import requests
 
@@ -62,8 +63,14 @@ UPLOAD_DIR = "/opt/bots/bot3/file"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ссылки на вложения Zulip
+# 1) markdown-вид: [Имя файла (1).png](/user_uploads/...)
+# 2) "голая" ссылка
+UPLOAD_MD_RE = re.compile(
+    r'\[(?P<name>[^\]]+)\]\(\s*(?:' + re.escape(ZULIP_SITE) + r')?'
+    r'(?P<path>/user_uploads/[^)\s]+)\s*\)'
+)
 UPLOAD_URL_RE = re.compile(
-    r'(?:' + re.escape(ZULIP_SITE) + r')?(?P<path>/user_uploads/[^\s)]+)'
+    r'(?:' + re.escape(ZULIP_SITE) + r')?(?P<path>/user_uploads/[^\s)\]]+)'
 )
 logging.basicConfig(
     level=logging.INFO,
@@ -355,16 +362,82 @@ def choose_assignee_from_body(body: str, default_id: int = 408) -> int:
 # ===================== РАБОТА С ВЛОЖЕНИЯМИ ИЗ ZULIP =====================
 
 def sanitize_filename(name: str, fallback: str = "upload.bin") -> str:
-    """Имя файла, совместимое с windows-1251."""
-    name = os.path.basename(name)
-    safe = name.encode("windows-1251", errors="ignore").decode("windows-1251").strip()
-    return safe or fallback
+    """
+    Приводим имя файла к безопасному виду, НЕ обрезая его.
+    Раньше символы, отсутствующие в windows-1251 (эмодзи и т.п.),
+    просто выкидывались, из-за чего имя вложения "обрезалось".
+    """
+    # только имя, без путей (в т.ч. windows-разделителей)
+    name = os.path.basename(name.replace("\\", "/")).strip()
+    # снимаем URL-кодирование: %D0%9E%D1%82%D1%87%D0%B5%D1%82.docx -> Отчет.docx
+    try:
+        name = unquote(name)
+    except Exception:
+        pass
+
+    # запрещённые в ФС символы
+    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name)
+
+    # символы, непредставимые в windows-1251, заменяем, а не удаляем
+    safe_chars = []
+    for ch in name:
+        try:
+            ch.encode("windows-1251")
+            safe_chars.append(ch)
+        except UnicodeEncodeError:
+            safe_chars.append("_")
+    name = "".join(safe_chars).strip(" .")
+
+    if not name:
+        return fallback
+
+    # ограничение ФС: 255 байт, но обрезаем аккуратно, сохраняя расширение
+    stem, ext = os.path.splitext(name)
+    max_bytes = 200
+    if len(name.encode("utf-8")) > max_bytes:
+        ext_b = len(ext.encode("utf-8"))
+        stem_b = stem.encode("utf-8")[: max(1, max_bytes - ext_b)]
+        stem = stem_b.decode("utf-8", errors="ignore")
+        name = stem + ext
+
+    return name or fallback
 
 
-def download_zulip_file(path: str) -> Optional[Tuple[str, str]]:
+def _filename_from_response(resp, default: str) -> str:
+    """Пытаемся взять настоящее имя файла из Content-Disposition."""
+    cd = resp.headers.get("Content-Disposition", "")
+    if not cd:
+        return default
+    m = re.search(r"filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)", cd)
+    if m:
+        return unquote(m.group(1).strip())
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd) or re.search(r"filename\s*=\s*([^;]+)", cd)
+    if m:
+        return m.group(1).strip()
+    return default
+
+
+def _unique_path(directory: str, filename: str) -> str:
+    """Не перетираем ранее скачанные файлы с таким же именем."""
+    full = os.path.join(directory, filename)
+    if not os.path.exists(full):
+        return full
+    stem, ext = os.path.splitext(filename)
+    i = 1
+    while True:
+        candidate = os.path.join(directory, f"{stem}_{i}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+
+def download_zulip_file(path: str, display_name: Optional[str] = None) -> Optional[Tuple[str, str]]:
     """
     Скачивает файл с Zulip по пути /user_uploads/... ,
     сохраняет в UPLOAD_DIR, возвращает (full_path, filename).
+
+    display_name — имя из markdown-ссылки [имя](/user_uploads/...), оно
+    приоритетнее, чем последний сегмент URL.
     """
     path = path.split("?")[0]
     url = ZULIP_SITE + path
@@ -383,9 +456,10 @@ def download_zulip_file(path: str) -> Optional[Tuple[str, str]]:
         logging.error("Не удалось скачать %s: статус %s", url, resp.status_code)
         return None
 
-    filename_raw = path.split("/")[-1]
+    filename_raw = display_name or _filename_from_response(resp, unquote(path.split("/")[-1]))
     filename = sanitize_filename(filename_raw)
-    full_path = os.path.join(UPLOAD_DIR, filename)
+    full_path = _unique_path(UPLOAD_DIR, filename)
+    filename = os.path.basename(full_path)
 
     try:
         with open(full_path, "wb") as f:
@@ -396,6 +470,7 @@ def download_zulip_file(path: str) -> Optional[Tuple[str, str]]:
         logging.error("Ошибка записи файла %s: %s", full_path, e)
         return None
 
+    logging.info("Скачано вложение %s -> %s", filename_raw, full_path)
     return full_path, filename
 
 
@@ -405,9 +480,26 @@ def collect_uploads_from_content(content: str) -> List[dict]:
     скачиваем файлы и формируем список uploads для Redmine.
     """
     uploads: List[dict] = []
+    seen_paths = set()
 
+    # сначала markdown-ссылки — из них берём полное отображаемое имя
+    for m in UPLOAD_MD_RE.finditer(content):
+        rel_path = m.group("path")
+        if rel_path in seen_paths:
+            continue
+        seen_paths.add(rel_path)
+        res = download_zulip_file(rel_path, display_name=m.group("name"))
+        if not res:
+            continue
+        full_path, filename = res
+        uploads.append({"path": full_path, "filename": filename})
+
+    # затем "голые" ссылки
     for m in UPLOAD_URL_RE.finditer(content):
         rel_path = m.group("path")
+        if rel_path in seen_paths:
+            continue
+        seen_paths.add(rel_path)
         res = download_zulip_file(rel_path)
         if not res:
             continue
