@@ -132,13 +132,55 @@ def detect_cp1251(text: str) -> str:
     return text
 
 
+FENCE_LINE_RE = re.compile(r'(?m)^[ \t]*(?:`{3,}|~{3,})[ \t]*\w*[ \t]*$')
+
+
+def strip_fences(text: Optional[str]) -> str:
+    """
+    Убираем из текста строки-ограничители markdown-блоков:
+    ```quote, ```, ```python, ~~~ и т.п.
+    Содержимое блоков сохраняем — режем только сами маркеры,
+    иначе они попадают в Redmine "как есть".
+    """
+    if not text:
+        return ""
+    text = FENCE_LINE_RE.sub("", text)
+    # маркеры, приклеенные к тексту в одной строке: "```quote Привет"
+    text = re.sub(r'(?:`{3,}|~{3,})[ \t]*(?:quote|spoiler|math)?', "", text)
+    # схлопываем пустоты, образовавшиеся после удаления маркеров
+    text = re.sub(r'\n{3,}', "\n\n", text)
+    return text.strip("\n")
+
+
 def split_quote_and_body(content: str) -> Tuple[Optional[str], str]:
-    m = re.match(r'(?s)^(?P<prefix>.*?)```quote\s*(?P<quoted>.*?)\s*```(?P<suffix>.*)$', content)
-    if m:
-        quoted = m.group("quoted").strip("\n")
-        body = (m.group("prefix") + "\n" + m.group("suffix")).strip("\n")
-        return quoted, body
-    return None, content.strip("\n")
+    """
+    Вытаскиваем ВСЕ ```quote ... ``` блоки (в т.ч. вложенные и несколько подряд),
+    остальное считаем телом сообщения.
+    Раньше обрабатывался только первый блок, из-за чего маркеры остальных
+    блоков утекали в описание задачи.
+    """
+    if not content:
+        return None, ""
+
+    quote_re = re.compile(r'(?s)```quote\s*(?P<quoted>.*?)\s*```')
+
+    quoted_parts: List[str] = []
+    body = content
+
+    # несколько проходов — раскрываем вложенные цитаты
+    for _ in range(5):
+        found = quote_re.findall(body)
+        if not found:
+            break
+        quoted_parts.extend(found)
+        body = quote_re.sub("\n", body)
+
+    quoted = strip_fences("\n\n".join(p for p in quoted_parts if p.strip())) or None
+    body = strip_fences(body)
+
+    if quoted is None:
+        return None, content.strip("\n")
+    return quoted, body
 
 
 def extract_subject_candidate(text: Optional[str]) -> Optional[str]:
@@ -600,6 +642,7 @@ def create_or_update_issue_from_message(msg, content: str) -> None:
             or "Тема задачи"
     )
 
+    subject_raw = strip_fences(subject_raw)
     subject_raw = strip_emoji(subject_raw)
     subject = detect_cp1251(subject_raw)[:255]
 
@@ -621,17 +664,25 @@ def create_or_update_issue_from_message(msg, content: str) -> None:
             user_comment_text = "\n".join(cleaned_lines).strip()
 
     if user_comment_text:
+        user_comment_text = strip_fences(user_comment_text)
         user_comment_text = strip_emoji(user_comment_text)
         user_comment_text = detect_cp1251(user_comment_text)
+    if user_comment_text:
         description_parts.append(f"<pre>\n{user_comment_text}\n</pre>")
 
     # цитата как дополнительная информация
     if quoted:
-        quoted_clean = strip_emoji(quoted)
-        quoted_clean = detect_cp1251(quoted)
-        description_parts.append("Дополнительная информация:\n<pre>\n" + quoted_clean + "\n</pre>")
+        quoted_clean = strip_fences(quoted)
+        quoted_clean = strip_emoji(quoted_clean)
+        # ВАЖНО: было detect_cp1251(quoted) — терялся результат strip_emoji
+        quoted_clean = detect_cp1251(quoted_clean)
+        if quoted_clean.strip():
+            description_parts.append(
+                "Дополнительная информация:\n<pre>\n" + quoted_clean + "\n</pre>"
+            )
 
     description = "\n\n".join(description_parts)
+    description = strip_fences(description)
     description = strip_emoji(description)
     description = detect_cp1251(description)
 
