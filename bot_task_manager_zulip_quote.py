@@ -183,33 +183,71 @@ def split_quote_and_body(content: str) -> Tuple[Optional[str], str]:
     return quoted, body
 
 
+# строки, которые не годятся в качестве темы задачи
+GREETING_RE = re.compile(
+    r'^(?:добр(?:ый|ое|ой)\s+(?:день|утро|вечер|ночи)|здравствуйте|привет|'
+    r'коллеги|всем\s+привет|доброго\s+времени.*|спасибо|пожалуйста|ок|хорошо)'
+    r'[\s,.!:;-]*$',
+    re.I
+)
+# "09:46 Максим Чистяков", "Сегодня в 10:34", "12.05.2026 10:00"
+TIMESTAMP_LINE_RE = re.compile(
+    r'^\s*(?:\d{1,2}[.:/-]\d{2}(?:[.:/-]\d{2,4})?|сегодня|вчера)\b.{0,60}$',
+    re.I
+)
+FENCE_ONLY_RE = re.compile(r'^\s*(?:`{3,}|~{3,})\s*\w*\s*$')
+
+
 def extract_subject_candidate(text: Optional[str]) -> Optional[str]:
     """
     Возвращает первую осмысленную строку для темы задачи.
 
-    Правила:
-    - удаляем упоминания (@**...**)
-    - пропускаем пустые строки
-    - пропускаем строки-команды вида '+ #123' / '+ url'
-    - пропускаем строки, состоящие только из URL
+    Пропускаем:
+    - упоминания (@**...**) — вырезаются из строки
+    - пустые строки и маркеры код-блоков (```quote и т.п.)
+    - строки-команды вида '+ #123' / '+ url'
+    - строки, состоящие только из URL
+    - приветствия ("Добрый день", "Коллеги", ...)
+    - строки-заголовки цитаты Zulip ("09:46 Максим Чистяков")
+    - слишком короткие строки (< 8 символов)
     """
     if not text:
         return None
 
     cmd_pattern = r'^\s*\+\s*(?:#\d+|https?://[^\s]*/issues/\d+)\s*$'
     cleaned = MENTION_RE.sub("", text)
+    cleaned = re.sub(r'@_?\*\*[^*]*\*\*', "", cleaned)
 
-    for line in cleaned.splitlines():
-        line = line.strip()
+    fallback: Optional[str] = None
+
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        # markdown-мусор по краям
+        line = line.strip("*_>#`").strip()
         if not line:
+            continue
+        if FENCE_ONLY_RE.match(line):
             continue
         if re.search(cmd_pattern, line):
             continue
         if re.fullmatch(r'https?://\S+', line):
             continue
-        return line
+        # строка вида "текст https://..." -> убираем голый URL из темы
+        line_wo_url = re.sub(r'https?://\S+', "", line).strip(" -–—:,.")
+        if not line_wo_url:
+            continue
+        if GREETING_RE.match(line_wo_url):
+            continue
+        if TIMESTAMP_LINE_RE.match(line_wo_url):
+            continue
+        if len(line_wo_url) < 8:
+            # запомним как запасной вариант, но поищем строку получше
+            if fallback is None:
+                fallback = line_wo_url
+            continue
+        return line_wo_url
 
-    return None
+    return fallback
 
 
 def find_issue_ids(text: str) -> List[str]:
