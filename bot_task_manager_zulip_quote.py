@@ -652,39 +652,29 @@ def create_or_update_issue_from_message(msg, content: str) -> None:
     initiator_line = f"Инициатор: {msg['sender_full_name']} ({msg['sender_email']})"
     description_parts.append(initiator_line)
 
-    # комментарий пользователя (body)
-    user_comment_text = None
-    if body:
-        if append_issue_id is None:
-            user_comment_text = body.strip()
-        else:
-            cmd_pattern = r'^\s*\+\s*(?:#\d+|https?://[^\s]*/issues/\d+)\s*$'
-            blines = body.splitlines()
-            cleaned_lines = [line for line in blines if not re.search(cmd_pattern, line)]
-            user_comment_text = "\n".join(cleaned_lines).strip()
+    # Единый блок "Исходный текст сообщения": ВЕСЬ текст сообщения как есть
+    # (вместе с ```quote и т.п.), без отдельной секции "Дополнительная информация".
+    cmd_pattern = r'^\s*\+\s*(?:#\d+|https?://[^\s]*/issues/\d+)\s*$'
 
-    if user_comment_text:
-        user_comment_text = strip_fences(user_comment_text)
-        user_comment_text = strip_emoji(user_comment_text)
-        user_comment_text = detect_cp1251(user_comment_text)
-    if user_comment_text:
-        description_parts.append(f"<pre>\n{user_comment_text}\n</pre>")
+    source_text = content or ""
 
-    # цитата как дополнительная информация
-    if quoted:
-        quoted_clean = strip_fences(quoted)
-        quoted_clean = strip_emoji(quoted_clean)
-        # ВАЖНО: было detect_cp1251(quoted) — терялся результат strip_emoji
-        quoted_clean = detect_cp1251(quoted_clean)
-        if quoted_clean.strip():
-            description_parts.append(
-                "Дополнительная информация:\n<pre>\n" + quoted_clean + "\n</pre>"
-            )
+    # в режиме "+ #id" убираем только служебную строку-команду
+    if append_issue_id is not None:
+        source_text = "\n".join(
+            line for line in source_text.splitlines()
+            if not re.search(cmd_pattern, line)
+        )
+
+    source_text = strip_emoji(source_text)
+    source_text = detect_cp1251(source_text)
+    source_text = source_text.strip("\n").strip()
+
+    if source_text:
+        description_parts.append(
+            "Исходный текст сообщения:\n<pre>\n" + source_text + "\n</pre>"
+        )
 
     description = "\n\n".join(description_parts)
-    description = strip_fences(description)
-    description = strip_emoji(description)
-    description = detect_cp1251(description)
 
     # ===== Режим "+ задача": добавить комментарий =====
     if append_issue_id is not None:
